@@ -25,6 +25,7 @@
  *   GET  /collections     -> CollectionInfo[] (names, doc counts, last modified)
  *   GET  /search?q=...    -> { results: SearchResult[], total: number }
  *   GET  /browse?limit=N  -> { chunks: [...], total, limit, offset }
+ *   POST /vsearch         { query, limit?, collection?, precomputedEmbedding? } -> { results, total }
  */
 
 import { createServer, type IncomingMessage, type ServerResponse } from "http";
@@ -46,7 +47,9 @@ import {
   createStore,
   enableProductionMode,
   searchFTS,
+  searchVec,
   listCollections,
+  DEFAULT_EMBED_MODEL,
   type Store,
 } from "./store.js";
 
@@ -536,6 +539,53 @@ export async function startServer(options: ServeOptions = {}): Promise<void> {
         return;
       }
 
+      // ----- Semantic / vector search -----------------------------------------
+      // POST /vsearch { query: string, limit?: number, collection?: string, precomputedEmbedding?: number[] }
+      // The query is embedded by whichever backend this serve process is
+      // configured with (rkllama on NPU, or local node-llama-cpp). Callers
+      // that already have a query embedding can pass precomputedEmbedding
+      // instead of query to skip the embed step. If the resulting
+      // embedding dimension does not match the configured vectors_vec
+      // table, sqlite-vec throws a clear error which is returned as a 500.
+      if (path === "/vsearch") {
+        if (!store) {
+          json(res, 503, { error: "No index database loaded" });
+          return;
+        }
+        const { query, limit, collection, precomputedEmbedding } = body as {
+          query?: string;
+          limit?: number;
+          collection?: string;
+          precomputedEmbedding?: number[];
+        };
+        if (!query && !precomputedEmbedding) {
+          json(res, 400, { error: "query or precomputedEmbedding is required" });
+          return;
+        }
+        let embedding: number[];
+        if (precomputedEmbedding) {
+          embedding = precomputedEmbedding;
+        } else {
+          const result = await backend.embed(query as string);
+          if (!result || !result.embedding) {
+            json(res, 500, { error: "backend.embed returned no embedding" });
+            return;
+          }
+          embedding = Array.from(result.embedding);
+        }
+        const results = await searchVec(
+          store.db,
+          query ?? "",
+          DEFAULT_EMBED_MODEL,
+          limit ?? 20,
+          collection,
+          undefined,
+          embedding,
+        );
+        json(res, 200, { results, total: results.length });
+        return;
+      }
+
       // ----- Tokenize ---------------------------------------------------------
       if (path === "/tokenize") {
         const { text } = body as { text: string };
@@ -572,7 +622,7 @@ export async function startServer(options: ServeOptions = {}): Promise<void> {
       console.log(`[qmd serve] Listening on http://${bind}:${port}`);
       console.log(`[qmd serve] Endpoints: /embed, /embed-batch, /rerank, /expand, /tokenize, /health`);
       if (store) {
-        console.log(`[qmd serve] Index endpoints: /status, /collections, /search, /browse`);
+        console.log(`[qmd serve] Index endpoints: /status, /collections, /search, /browse, /vsearch`);
       }
     });
   });
