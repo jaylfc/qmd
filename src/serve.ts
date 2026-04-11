@@ -25,7 +25,16 @@
  *   GET  /collections     -> CollectionInfo[] (names, doc counts, last modified)
  *   GET  /search?q=...    -> { results: SearchResult[], total: number }
  *   GET  /browse?limit=N  -> { chunks: [...], total, limit, offset }
- *   POST /vsearch         { query, limit?, collection?, precomputedEmbedding? } -> { results, total }
+ *   POST /vsearch         { query, limit?, collection?, dbPath?, precomputedEmbedding? }
+ *   POST /ingest          { body, path, title?, collection?, dbPath? }
+ *   POST /delete-chunk    { hash, dbPath? }
+ *
+ * All index endpoints (status, collections, search, browse, vsearch,
+ * ingest, delete-chunk) accept an optional ``dbPath`` that routes the
+ * request at a specific SQLite file. One serve process can therefore
+ * host many tenant indexes — e.g. per-agent memory under
+ * ``data/agent-memory/{name}/index.sqlite`` — without restart. Stores
+ * are opened lazily on first use and cached for the process lifetime.
  */
 
 import { createServer, type IncomingMessage, type ServerResponse } from "http";
@@ -43,12 +52,16 @@ import {
   DEFAULT_GENERATE_MODEL_URI,
 } from "./llm.js";
 
+import { createHash } from "crypto";
 import {
   createStore,
   enableProductionMode,
   searchFTS,
   searchVec,
   listCollections,
+  insertContent,
+  insertDocument,
+  insertEmbedding,
   DEFAULT_EMBED_MODEL,
   type Store,
 } from "./store.js";
@@ -381,13 +394,36 @@ export async function startServer(options: ServeOptions = {}): Promise<void> {
   // Open the QMD index database for search/browse/collections endpoints.
   // If no dbPath is specified, uses the default (~/.cache/qmd/index.sqlite).
   enableProductionMode();
-  let store: Store | null = null;
+  let defaultStore: Store | null = null;
   try {
-    store = createStore(options.dbPath);
-    console.log(`[qmd serve] Index: ${store.dbPath}`);
+    defaultStore = createStore(options.dbPath);
+    console.log(`[qmd serve] Default index: ${defaultStore.dbPath}`);
   } catch (err) {
-    console.warn(`[qmd serve] No index database found — search/browse endpoints disabled`);
+    console.warn(`[qmd serve] No default index database found — search/browse endpoints will require an explicit dbPath per request`);
   }
+
+  // Per-request stores, keyed by absolute dbPath. Callers pass dbPath
+  // on any index endpoint (query param for GET, body field for POST)
+  // to route their request at a different SQLite file — for example
+  // a per-agent memory index under
+  // ``data/agent-memory/{name}/index.sqlite``. One serve process,
+  // many tenants. Stores are opened lazily on first use, then cached
+  // for the lifetime of the process.
+  const storeCache = new Map<string, Store>();
+  const resolveStore = (dbPath?: string): Store | null => {
+    if (!dbPath) return defaultStore;
+    let store = storeCache.get(dbPath);
+    if (store) return store;
+    try {
+      store = createStore(dbPath);
+    } catch (err) {
+      console.warn(`[qmd serve] failed to open store at ${dbPath}: ${(err as Error).message}`);
+      return null;
+    }
+    storeCache.set(dbPath, store);
+    console.log(`[qmd serve] opened tenant index: ${store.dbPath}`);
+    return store;
+  };
 
   const server = createServer(async (req, res) => {
     // CORS for local network
@@ -415,6 +451,7 @@ export async function startServer(options: ServeOptions = {}): Promise<void> {
       // ----- Index endpoints (require store) -----------------------------------
 
       if (path === "/status" && req.method === "GET") {
+        const store = resolveStore(url.searchParams.get("dbPath") || undefined);
         if (!store) { json(res, 503, { error: "No index database loaded" }); return; }
         const status = store.getStatus();
         json(res, 200, status);
@@ -422,6 +459,7 @@ export async function startServer(options: ServeOptions = {}): Promise<void> {
       }
 
       if (path === "/collections" && req.method === "GET") {
+        const store = resolveStore(url.searchParams.get("dbPath") || undefined);
         if (!store) { json(res, 503, { error: "No index database loaded" }); return; }
         const collections = listCollections(store.db);
         json(res, 200, collections);
@@ -429,6 +467,7 @@ export async function startServer(options: ServeOptions = {}): Promise<void> {
       }
 
       if (path === "/search" && req.method === "GET") {
+        const store = resolveStore(url.searchParams.get("dbPath") || undefined);
         if (!store) { json(res, 503, { error: "No index database loaded" }); return; }
         const query = url.searchParams.get("q") || url.searchParams.get("query");
         if (!query) { json(res, 400, { error: "q or query parameter is required" }); return; }
@@ -440,6 +479,7 @@ export async function startServer(options: ServeOptions = {}): Promise<void> {
       }
 
       if (path === "/browse" && req.method === "GET") {
+        const store = resolveStore(url.searchParams.get("dbPath") || undefined);
         if (!store) { json(res, 503, { error: "No index database loaded" }); return; }
         const limit = parseInt(url.searchParams.get("limit") || "20", 10);
         const offset = parseInt(url.searchParams.get("offset") || "0", 10);
@@ -540,24 +580,27 @@ export async function startServer(options: ServeOptions = {}): Promise<void> {
       }
 
       // ----- Semantic / vector search -----------------------------------------
-      // POST /vsearch { query: string, limit?: number, collection?: string, precomputedEmbedding?: number[] }
+      // POST /vsearch { query, limit?, collection?, dbPath?, precomputedEmbedding? }
       // The query is embedded by whichever backend this serve process is
       // configured with (rkllama on NPU, or local node-llama-cpp). Callers
       // that already have a query embedding can pass precomputedEmbedding
       // instead of query to skip the embed step. If the resulting
       // embedding dimension does not match the configured vectors_vec
       // table, sqlite-vec throws a clear error which is returned as a 500.
+      // dbPath selects a specific tenant index (see resolveStore above).
       if (path === "/vsearch") {
+        const { query, limit, collection, precomputedEmbedding, dbPath } = body as {
+          query?: string;
+          limit?: number;
+          collection?: string;
+          dbPath?: string;
+          precomputedEmbedding?: number[];
+        };
+        const store = resolveStore(dbPath);
         if (!store) {
           json(res, 503, { error: "No index database loaded" });
           return;
         }
-        const { query, limit, collection, precomputedEmbedding } = body as {
-          query?: string;
-          limit?: number;
-          collection?: string;
-          precomputedEmbedding?: number[];
-        };
         if (!query && !precomputedEmbedding) {
           json(res, 400, { error: "query or precomputedEmbedding is required" });
           return;
@@ -586,6 +629,106 @@ export async function startServer(options: ServeOptions = {}): Promise<void> {
         return;
       }
 
+      // ----- Ingest a single chunk --------------------------------------------
+      // POST /ingest { body, path, title?, collection?, dbPath? }
+      // Hashes the body, inserts into content + documents, embeds via the
+      // configured backend, writes to content_vectors + vectors_vec, and
+      // makes the chunk immediately discoverable by /search and /vsearch.
+      // Designed for small-scale inserts (import-side UX, agent-authored
+      // notes) — bulk indexing still goes through `qmd update` on the CLI.
+      if (path === "/ingest") {
+        const {
+          body: docBody,
+          path: docPath,
+          title,
+          collection,
+          dbPath,
+        } = body as {
+          body?: string;
+          path?: string;
+          title?: string;
+          collection?: string;
+          dbPath?: string;
+        };
+        if (!docBody || !docPath) {
+          json(res, 400, { error: "body and path are required" });
+          return;
+        }
+        const store = resolveStore(dbPath);
+        if (!store) {
+          json(res, 503, { error: "No index database loaded" });
+          return;
+        }
+        const hash = createHash("sha256").update(docBody).digest("hex");
+        const now = new Date().toISOString();
+        const collectionName = collection ?? "default";
+        const docTitle = title ?? docPath;
+
+        // Embed first so a failure aborts before we write metadata.
+        const result = await backend.embed(docBody);
+        if (!result || !result.embedding) {
+          json(res, 500, { error: "backend.embed returned no embedding" });
+          return;
+        }
+        const embedding = new Float32Array(result.embedding);
+
+        // Make sure the vec table exists at the right dimension. If it
+        // doesn't exist yet, ensureVecTable creates it; if it does and
+        // the dimension is wrong, it drops and recreates.
+        store.ensureVecTable(embedding.length);
+
+        insertContent(store.db, hash, docBody, now);
+        insertDocument(store.db, collectionName, docPath, docTitle, hash, now, now);
+        insertEmbedding(store.db, hash, 0, 0, embedding, DEFAULT_EMBED_MODEL, now);
+
+        // FTS entry so /search picks it up too.
+        const docRow = store.db.prepare(
+          `SELECT id FROM documents WHERE collection = ? AND path = ? AND active = 1`,
+        ).get(collectionName, docPath) as { id: number } | undefined;
+        if (docRow) {
+          store.db.prepare(
+            `INSERT OR REPLACE INTO documents_fts (rowid, filepath, title, body) VALUES (?, ?, ?, ?)`,
+          ).run(docRow.id, `${collectionName}/${docPath}`, docTitle, docBody);
+        }
+
+        json(res, 200, {
+          hash,
+          collection: collectionName,
+          path: docPath,
+          title: docTitle,
+          embeddedDimensions: embedding.length,
+        });
+        return;
+      }
+
+      // ----- Delete a chunk ---------------------------------------------------
+      // POST /delete-chunk { hash, dbPath? }
+      // Removes all traces of a chunk: documents row, FTS row,
+      // content_vectors row, vectors_vec row, and content row. Safe to
+      // call for a hash that doesn't exist (no-op).
+      if (path === "/delete-chunk") {
+        const { hash, dbPath } = body as { hash?: string; dbPath?: string };
+        if (!hash) {
+          json(res, 400, { error: "hash is required" });
+          return;
+        }
+        const store = resolveStore(dbPath);
+        if (!store) {
+          json(res, 503, { error: "No index database loaded" });
+          return;
+        }
+        const docIds = store.db.prepare(`SELECT id FROM documents WHERE hash = ?`).all(hash) as { id: number }[];
+        for (const row of docIds) {
+          store.db.prepare(`DELETE FROM documents_fts WHERE rowid = ?`).run(row.id);
+        }
+        store.db.prepare(`DELETE FROM vectors_vec WHERE hash_seq LIKE ?`).run(`${hash}_%`);
+        store.db.prepare(`DELETE FROM content_vectors WHERE hash = ?`).run(hash);
+        store.db.prepare(`DELETE FROM documents WHERE hash = ?`).run(hash);
+        store.db.prepare(`DELETE FROM content WHERE hash = ?`).run(hash);
+        json(res, 200, { status: "deleted", hash, documentsRemoved: docIds.length });
+        return;
+      }
+
       // ----- Tokenize ---------------------------------------------------------
       if (path === "/tokenize") {
         const { text } = body as { text: string };
@@ -611,7 +754,9 @@ export async function startServer(options: ServeOptions = {}): Promise<void> {
     const shutdown = async () => {
       console.log("\n[qmd serve] Shutting down...");
       server.close();
-      if (store) store.close();
+      if (defaultStore) defaultStore.close();
+      for (const tenantStore of storeCache.values()) tenantStore.close();
+      storeCache.clear();
       await backend.dispose();
       resolve();
     };
@@ -621,8 +766,8 @@ export async function startServer(options: ServeOptions = {}): Promise<void> {
     server.listen(port, bind, () => {
       console.log(`[qmd serve] Listening on http://${bind}:${port}`);
       console.log(`[qmd serve] Endpoints: /embed, /embed-batch, /rerank, /expand, /tokenize, /health`);
-      if (store) {
-        console.log(`[qmd serve] Index endpoints: /status, /collections, /search, /browse, /vsearch`);
+      if (defaultStore) {
+        console.log(`[qmd serve] Index endpoints: /status, /collections, /search, /browse, /vsearch, /ingest, /delete-chunk`);
       }
     });
   });
