@@ -81,8 +81,9 @@ import {
   type ReindexResult,
   type ChunkStrategy,
 } from "../store.js";
-import { disposeDefaultLlamaCpp, getDefaultLlamaCpp, setDefaultLlamaCpp, setDefaultLLM, LlamaCpp, withLLMSession, pullModels, DEFAULT_MODEL_CACHE_DIR, resolveEmbedModel, resolveGenerateModel, resolveRerankModel, resolveModels, inspectGgufFile, isDarwinMetalMitigationActive } from "../llm.js";
+import { disposeDefaultLlamaCpp, getDefaultLlamaCpp, getDefaultLLM, setDefaultLlamaCpp, setDefaultLLM, LlamaCpp, withLLMSession, pullModels, DEFAULT_MODEL_CACHE_DIR, resolveEmbedModel, resolveGenerateModel, resolveRerankModel, resolveModels, inspectGgufFile, isDarwinMetalMitigationActive } from "../llm.js";
 import { RemoteLLM } from "../llm-remote.js";
+import { startServer } from "../serve.js";
 import {
   formatSearchResults,
   formatDocuments,
@@ -2895,6 +2896,8 @@ function parseCLI() {
       // Remote backend: route embedding/rerank/expansion to a `qmd serve`
       // endpoint instead of loading local models (also via env QMD_SERVER).
       server: { type: "string" },
+      // `qmd serve` bind address (default 0.0.0.0); pairs with --port.
+      bind: { type: "string" },
     },
     allowPositionals: true,
     strict: false, // Allow unknown options to pass through
@@ -4409,6 +4412,30 @@ if (isMain) {
     case "status":
       await showStatus();
       break;
+
+    case "serve": {
+      const port = cli.values.port ? parseInt(String(cli.values.port), 10) : 7832;
+      if (!Number.isInteger(port) || port <= 0) {
+        exitWithError(new Error(`invalid --port: ${cli.values.port}`));
+        break;
+      }
+      const bind = typeof cli.values.bind === "string" && cli.values.bind ? cli.values.bind : "0.0.0.0";
+      // Trigger backend setup (loads local models, or wires QMD_SERVER backend).
+      getStore();
+      const serveEmbedModel = resolveEmbedModelForCli();
+      const statusProvider = () => {
+        try { return getStatus(getDb(), serveEmbedModel); }
+        catch { return { ok: true }; }
+      };
+      await startServer({ port, bind, statusProvider });
+      const llm = getDefaultLLM();
+      console.log(`${c.bold}qmd serve${c.reset} listening on http://${bind}:${port}`);
+      console.log(`  embed:  ${llm.embedModelName}`);
+      console.log(`  rerank: ${llm.rerankModelName}`);
+      console.log(`  routes: POST /embed  POST /rerank  POST /expand  GET /health  GET /status`);
+      // startServer keeps the event loop alive; the process stays up until killed.
+      break;
+    }
 
     case "doctor":
       await showDoctor();
