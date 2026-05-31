@@ -65,6 +65,7 @@ import {
 } from "./store.js";
 import {
   LlamaCpp,
+  type LLM,
 } from "./llm.js";
 import {
   setConfigSource,
@@ -205,6 +206,12 @@ export interface StoreOptions {
   configPath?: string;
   /** Inline collection config (mutually exclusive with `configPath`) */
   config?: CollectionConfig;
+  /**
+   * Optional LLM backend for this store. When provided, it is used instead of
+   * the default per-store LlamaCpp instance — the injection seam for alternative
+   * backends (e.g. a remote model server). Defaults to a native LlamaCpp.
+   */
+  llm?: LLM;
 }
 
 /**
@@ -368,9 +375,10 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
   }
   // else: DB-only mode — no external config, use existing store_collections
 
-  // Create a per-store LlamaCpp instance — lazy-loads models on first use,
-  // auto-unloads after 5 min inactivity to free VRAM.
-  const llm = new LlamaCpp({
+  // Use an injected backend if provided; otherwise create a per-store LlamaCpp
+  // instance — lazy-loads models on first use, auto-unloads after 5 min
+  // inactivity to free VRAM.
+  const llm: LLM = options.llm ?? new LlamaCpp({
     embedModel: config?.models?.embed,
     generateModel: config?.models?.generate,
     rerankModel: config?.models?.rerank,

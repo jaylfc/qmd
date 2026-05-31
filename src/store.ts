@@ -20,8 +20,7 @@ import { readFileSync, realpathSync, statSync, mkdirSync } from "node:fs";
 import fastGlob from "fast-glob";
 import { qmdHomedir } from "./paths.js";
 import {
-  LlamaCpp,
-  getDefaultLlamaCpp,
+  getDefaultLLM,
   formatQueryForEmbedding,
   formatDocForEmbedding,
   withLLMSessionForLlm,
@@ -30,6 +29,7 @@ import {
   DEFAULT_GENERATE_MODEL_URI,
   type RerankDocument,
   type ILLMSession,
+  type LLM,
 } from "./llm.js";
 import type {
   NamedCollection,
@@ -77,11 +77,11 @@ export function getEmbeddingFingerprint(model: string = DEFAULT_EMBED_MODEL): st
 }
 
 /**
- * Get the LlamaCpp instance for a store — prefers the store's own instance,
- * falls back to the global singleton.
+ * Get the LLM backend for a store — prefers the store's own instance,
+ * falls back to the global default backend.
  */
-function getLlm(store: Store): LlamaCpp {
-  return store.llm ?? getDefaultLlamaCpp();
+function getLlm(store: Store): LLM {
+  return store.llm ?? getDefaultLLM();
 }
 
 // =============================================================================
@@ -1176,8 +1176,8 @@ function ensureVecTableInternal(db: Database, dimensions: number): void {
 export type Store = {
   db: Database;
   dbPath: string;
-  /** Optional LlamaCpp instance for this store (overrides the global singleton) */
-  llm?: LlamaCpp;
+  /** Optional LLM backend for this store (overrides the global default) */
+  llm?: LLM;
   close: () => void;
   ensureVecTable: (dimensions: number) => void;
 
@@ -2633,7 +2633,13 @@ export async function chunkDocumentByTokens(
   chunkStrategy: ChunkStrategy = "regex",
   signal?: AbortSignal
 ): Promise<{ text: string; pos: number; tokens: number }[]> {
-  const llm = getDefaultLlamaCpp();
+  const llm = getDefaultLLM();
+
+  // Token-aware splitting needs both tokenize + detokenize. Native backends
+  // (llama.cpp) provide them; remote/HTTP backends with no local tokenizer omit
+  // them, in which case we fall back to a character-based estimate so chunking
+  // still produces bounded chunks (see PR: pluggable LLM backend).
+  const canTokenize = typeof llm.tokenize === "function" && typeof llm.detokenize === "function";
 
   // Use moderate chars/token estimate (prose ~4, code ~2, mixed ~3)
   // If chunks exceed limit, they'll be re-split with actual ratio
@@ -2653,16 +2659,21 @@ export async function chunkDocumentByTokens(
     return Math.max(0, Math.min(maxChars - 1, Math.floor(value)));
   };
 
+  const estimateTokenCount = (text: string): number =>
+    Math.max(1, Math.ceil(text.length / avgCharsPerToken));
+
   const pushChunkWithinTokenLimit = async (text: string, pos: number): Promise<void> => {
     if (signal?.aborted) return;
 
-    const tokens = await llm.tokenize(text);
-    if (tokens.length <= maxTokens || text.length <= 1) {
-      results.push({ text, pos, tokens: tokens.length });
+    // Exact token count when the backend can tokenize; estimated otherwise.
+    const tokens = canTokenize ? await llm.tokenize!(text) : null;
+    const tokenCount = tokens ? tokens.length : estimateTokenCount(text);
+    if (tokenCount <= maxTokens || text.length <= 1) {
+      results.push({ text, pos, tokens: tokenCount });
       return;
     }
 
-    const actualCharsPerToken = text.length / tokens.length;
+    const actualCharsPerToken = tokens ? text.length / tokens.length : avgCharsPerToken;
     let safeMaxChars = Math.floor(maxTokens * actualCharsPerToken * 0.95);
     if (!Number.isFinite(safeMaxChars) || safeMaxChars < 1) {
       safeMaxChars = Math.floor(text.length / 2);
@@ -2692,13 +2703,24 @@ export async function chunkDocumentByTokens(
       subChunks.length <= 1
       || subChunks[0]?.text.length === text.length
     ) {
-      const fallbackTokens = tokens.slice(0, Math.max(1, maxTokens));
-      const truncatedText = await llm.detokenize(fallbackTokens);
-      results.push({
-        text: truncatedText,
-        pos,
-        tokens: fallbackTokens.length,
-      });
+      // Cannot subdivide further — hard-truncate to the token budget.
+      if (tokens) {
+        const fallbackTokens = tokens.slice(0, Math.max(1, maxTokens));
+        const truncatedText = await llm.detokenize!(fallbackTokens);
+        results.push({
+          text: truncatedText,
+          pos,
+          tokens: fallbackTokens.length,
+        });
+      } else {
+        // No tokenizer available: truncate in character space.
+        const truncatedText = text.slice(0, safeMaxChars);
+        results.push({
+          text: truncatedText,
+          pos,
+          tokens: estimateTokenCount(truncatedText),
+        });
+      }
       return;
     }
 
@@ -3554,12 +3576,12 @@ export async function searchVec(db: Database, query: string, model: string, limi
 // Embeddings
 // =============================================================================
 
-async function getEmbedding(text: string, model: string, isQuery: boolean, session?: ILLMSession, llmOverride?: LlamaCpp): Promise<number[] | null> {
+async function getEmbedding(text: string, model: string, isQuery: boolean, session?: ILLMSession, llmOverride?: LLM): Promise<number[] | null> {
   // Format text using the appropriate prompt template
   const formattedText = isQuery ? formatQueryForEmbedding(text, model) : formatDocForEmbedding(text, undefined, model);
   const result = session
     ? await session.embed(formattedText, { model, isQuery })
-    : await (llmOverride ?? getDefaultLlamaCpp()).embed(formattedText, { model, isQuery });
+    : await (llmOverride ?? getDefaultLLM()).embed(formattedText, { model, isQuery });
   return result?.embedding || null;
 }
 
@@ -3714,7 +3736,7 @@ function removeIncompleteEmbeddings(db: Database, expectedChunksByHash: Map<stri
 // Query expansion
 // =============================================================================
 
-export async function expandQuery(query: string, model: string = DEFAULT_QUERY_MODEL, db: Database, intent?: string, llmOverride?: LlamaCpp): Promise<ExpandedQuery[]> {
+export async function expandQuery(query: string, model: string = DEFAULT_QUERY_MODEL, db: Database, intent?: string, llmOverride?: LLM): Promise<ExpandedQuery[]> {
   // Check cache first — stored as JSON preserving types
   const cacheKey = getCacheKey("expandQuery", { query, model, ...(intent && { intent }) });
   const cached = getCachedResult(db, cacheKey);
@@ -3734,7 +3756,7 @@ export async function expandQuery(query: string, model: string = DEFAULT_QUERY_M
     }
   }
 
-  const llm = llmOverride ?? getDefaultLlamaCpp();
+  const llm = llmOverride ?? getDefaultLLM();
   // Note: LlamaCpp uses hardcoded model, model parameter is ignored
   const results = await llm.expandQuery(query, { intent });
 
@@ -3755,7 +3777,7 @@ export async function expandQuery(query: string, model: string = DEFAULT_QUERY_M
 // Reranking
 // =============================================================================
 
-export async function rerank(query: string, documents: { file: string; text: string }[], model: string = DEFAULT_RERANK_MODEL, db: Database, intent?: string, llmOverride?: LlamaCpp): Promise<{ file: string; score: number }[]> {
+export async function rerank(query: string, documents: { file: string; text: string }[], model: string = DEFAULT_RERANK_MODEL, db: Database, intent?: string, llmOverride?: LLM): Promise<{ file: string; score: number }[]> {
   // Prepend intent to rerank query so the reranker scores with domain context
   const rerankQuery = intent ? `${intent}\n\n${query}` : query;
 
@@ -3780,7 +3802,7 @@ export async function rerank(query: string, documents: { file: string; text: str
 
   // Rerank uncached documents using LlamaCpp
   if (uncachedDocsByChunk.size > 0) {
-    const llm = llmOverride ?? getDefaultLlamaCpp();
+    const llm = llmOverride ?? getDefaultLLM();
     const uncachedDocs = [...uncachedDocsByChunk.values()];
     const rerankResult = await llm.rerank(rerankQuery, uncachedDocs, { model });
 

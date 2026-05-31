@@ -525,6 +525,11 @@ export interface LLM {
   embed(text: string, options?: EmbedOptions): Promise<EmbeddingResult | null>;
 
   /**
+   * Get embeddings for a batch of texts.
+   */
+  embedBatch(texts: string[], options?: EmbedOptions): Promise<(EmbeddingResult | null)[]>;
+
+  /**
    * Generate text completion
    */
   generate(prompt: string, options?: GenerateOptions): Promise<GenerateResult | null>;
@@ -538,7 +543,7 @@ export interface LLM {
    * Expand a search query into multiple variations for different backends.
    * Returns a list of Queryable objects.
    */
-  expandQuery(query: string, options?: { context?: string, includeLexical?: boolean }): Promise<Queryable[]>;
+  expandQuery(query: string, options?: { context?: string, includeLexical?: boolean, intent?: string }): Promise<Queryable[]>;
 
   /**
    * Rerank documents by relevance to a query
@@ -550,6 +555,23 @@ export interface LLM {
    * Dispose of resources
    */
   dispose(): Promise<void>;
+
+  /** Name of the embedding model this backend will use. */
+  readonly embedModelName: string;
+  /** Name of the text-generation model this backend will use. */
+  readonly generateModelName: string;
+  /** Name of the rerank model this backend will use. */
+  readonly rerankModelName: string;
+
+  /**
+   * Optional token-level capabilities. Native backends (llama.cpp) implement
+   * these; remote/HTTP backends that have no local tokenizer may omit them.
+   * Consumers MUST treat them as optional and fall back to character-based
+   * handling when absent (see chunk truncation in store.ts).
+   */
+  tokenize?(text: string): Promise<readonly LlamaToken[]>;
+  detokenize?(tokens: readonly LlamaToken[]): Promise<string>;
+  countTokens?(text: string): Promise<number>;
 }
 
 // =============================================================================
@@ -1714,11 +1736,11 @@ export class LlamaCpp implements LLM {
  * Coordinates with LlamaCpp idle timeout to prevent disposal during active sessions.
  */
 class LLMSessionManager {
-  private llm: LlamaCpp;
+  private llm: LLM;
   private _activeSessionCount = 0;
   private _inFlightOperations = 0;
 
-  constructor(llm: LlamaCpp) {
+  constructor(llm: LLM) {
     this.llm = llm;
   }
 
@@ -1754,7 +1776,7 @@ class LLMSessionManager {
     this._inFlightOperations = Math.max(0, this._inFlightOperations - 1);
   }
 
-  getLlamaCpp(): LlamaCpp {
+  getLLM(): LLM {
     return this.llm;
   }
 }
@@ -1857,18 +1879,18 @@ class LLMSession implements ILLMSession {
   }
 
   async embed(text: string, options?: EmbedOptions): Promise<EmbeddingResult | null> {
-    return this.withOperation(() => this.manager.getLlamaCpp().embed(text, options));
+    return this.withOperation(() => this.manager.getLLM().embed(text, options));
   }
 
   async embedBatch(texts: string[], options?: EmbedOptions): Promise<(EmbeddingResult | null)[]> {
-    return this.withOperation(() => this.manager.getLlamaCpp().embedBatch(texts, options));
+    return this.withOperation(() => this.manager.getLLM().embedBatch(texts, options));
   }
 
   async expandQuery(
     query: string,
     options?: { context?: string; includeLexical?: boolean }
   ): Promise<Queryable[]> {
-    return this.withOperation(() => this.manager.getLlamaCpp().expandQuery(query, options));
+    return this.withOperation(() => this.manager.getLLM().expandQuery(query, options));
   }
 
   async rerank(
@@ -1876,7 +1898,7 @@ class LLMSession implements ILLMSession {
     documents: RerankDocument[],
     options?: RerankOptions
   ): Promise<RerankResult> {
-    return this.withOperation(() => this.manager.getLlamaCpp().rerank(query, documents, options));
+    return this.withOperation(() => this.manager.getLLM().rerank(query, documents, options));
   }
 }
 
@@ -1887,8 +1909,8 @@ let defaultSessionManager: LLMSessionManager | null = null;
  * Get the session manager for the default LlamaCpp instance.
  */
 function getSessionManager(): LLMSessionManager {
-  const llm = getDefaultLlamaCpp();
-  if (!defaultSessionManager || defaultSessionManager.getLlamaCpp() !== llm) {
+  const llm = getDefaultLLM();
+  if (!defaultSessionManager || defaultSessionManager.getLLM() !== llm) {
     defaultSessionManager = new LLMSessionManager(llm);
   }
   return defaultSessionManager;
@@ -1927,7 +1949,7 @@ export async function withLLMSession<T>(
  * Unlike withLLMSession, this does not use the global singleton.
  */
 export async function withLLMSessionForLlm<T>(
-  llm: LlamaCpp,
+  llm: LLM,
   fn: (session: ILLMSession) => Promise<T>,
   options?: LLMSessionOptions
 ): Promise<T> {
@@ -2037,6 +2059,34 @@ export function getDefaultLlamaCpp(): LlamaCpp {
 export function setDefaultLlamaCpp(llm: LlamaCpp | null): void {
   if (llm !== null) installDarwinExitGuard();
   defaultLlamaCpp = llm;
+}
+
+// =============================================================================
+// Pluggable default LLM backend (injection seam)
+// =============================================================================
+//
+// By default the engine uses the native LlamaCpp singleton above. Callers may
+// inject an alternative LLM implementation (e.g. a remote/HTTP model server)
+// via setDefaultLLM(); getDefaultLLM() then returns it in place of LlamaCpp.
+// This is the single seam an alternative backend needs — every consumer
+// (session manager, store) resolves its backend through getDefaultLLM().
+
+let defaultLLM: LLM | null = null;
+
+/**
+ * Get the default LLM backend. Returns an injected backend if one was set via
+ * setDefaultLLM(), otherwise falls back to the native LlamaCpp singleton.
+ */
+export function getDefaultLLM(): LLM {
+  return defaultLLM ?? getDefaultLlamaCpp();
+}
+
+/**
+ * Inject a custom default LLM backend (e.g. a remote model server). Pass null
+ * to revert to the native LlamaCpp singleton.
+ */
+export function setDefaultLLM(llm: LLM | null): void {
+  defaultLLM = llm;
 }
 
 /**
