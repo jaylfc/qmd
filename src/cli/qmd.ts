@@ -81,7 +81,8 @@ import {
   type ReindexResult,
   type ChunkStrategy,
 } from "../store.js";
-import { disposeDefaultLlamaCpp, getDefaultLlamaCpp, setDefaultLlamaCpp, LlamaCpp, withLLMSession, pullModels, DEFAULT_MODEL_CACHE_DIR, resolveEmbedModel, resolveGenerateModel, resolveRerankModel, resolveModels, inspectGgufFile, isDarwinMetalMitigationActive } from "../llm.js";
+import { disposeDefaultLlamaCpp, getDefaultLlamaCpp, setDefaultLlamaCpp, setDefaultLLM, LlamaCpp, withLLMSession, pullModels, DEFAULT_MODEL_CACHE_DIR, resolveEmbedModel, resolveGenerateModel, resolveRerankModel, resolveModels, inspectGgufFile, isDarwinMetalMitigationActive } from "../llm.js";
+import { RemoteLLM } from "../llm-remote.js";
 import {
   formatSearchResults,
   formatDocuments,
@@ -131,14 +132,21 @@ function getStore(): ReturnType<typeof createStore> {
     store = createStore(storeDbPathOverride);
     // Sync YAML config into SQLite store_collections so store.ts reads from DB
     try {
-      const activeModels = ensureModelsConfiguredForCli();
       const config = loadConfig();
       syncConfigToDb(store.db, config);
-      setDefaultLlamaCpp(new LlamaCpp({
-        embedModel: activeModels.embed,
-        generateModel: activeModels.generate,
-        rerankModel: activeModels.rerank,
-      }));
+      const serverUrl = process.env.QMD_SERVER;
+      if (serverUrl) {
+        // Remote backend: embeddings/rerank/expansion are served by a remote
+        // `qmd serve` endpoint — no local models are loaded or required.
+        setDefaultLLM(new RemoteLLM(serverUrl));
+      } else {
+        const activeModels = ensureModelsConfiguredForCli();
+        setDefaultLlamaCpp(new LlamaCpp({
+          embedModel: activeModels.embed,
+          generateModel: activeModels.generate,
+          rerankModel: activeModels.rerank,
+        }));
+      }
     } catch {
       // Config may not exist yet — that's fine, DB works without it
     }
@@ -2884,6 +2892,9 @@ function parseCLI() {
       http: { type: "boolean" },
       daemon: { type: "boolean" },
       port: { type: "string" },
+      // Remote backend: route embedding/rerank/expansion to a `qmd serve`
+      // endpoint instead of loading local models (also via env QMD_SERVER).
+      server: { type: "string" },
     },
     allowPositionals: true,
     strict: false, // Allow unknown options to pass through
@@ -2891,6 +2902,12 @@ function parseCLI() {
 
   if (values["no-gpu"]) {
     process.env.QMD_FORCE_CPU = "1";
+  }
+
+  // --server <url> selects the remote backend for the rest of the process.
+  // Stored in env so the lazily-created store (getStore) picks it up.
+  if (typeof values.server === "string" && values.server) {
+    process.env.QMD_SERVER = values.server;
   }
 
   // Select index name (default: "index"). If no explicit --index is supplied,
