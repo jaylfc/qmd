@@ -671,7 +671,13 @@ qmd get <file>[:line]  # Get document, optionally starting at line
 
 ### Output Format
 
-Default output is colorized CLI format (respects `NO_COLOR` env):
+Default output is colorized CLI format (respects `NO_COLOR` env).
+
+When stdout is a TTY, result paths are emitted as clickable terminal hyperlinks (OSC 8). Clicking a path opens the file in your editor using an editor URI template.
+
+When stdout is not a TTY (for example piped to another command or redirected to a file), QMD emits plain text paths with no escape sequences.
+
+TTY example:
 
 ```
 docs/guide.md:42 #a1b2c3
@@ -692,6 +698,27 @@ Score: 67%
 Discussion about code quality and craftsmanship
 in the development process.
 ```
+
+Configure the editor link target with `QMD_EDITOR_URI` (or `editor_uri` in config):
+
+```sh
+# VS Code (default)
+export QMD_EDITOR_URI="vscode://file/{path}:{line}:{col}"
+
+# Cursor
+export QMD_EDITOR_URI="cursor://file/{path}:{line}:{col}"
+
+# Zed
+export QMD_EDITOR_URI="zed://file/{path}:{line}:{col}"
+
+# Sublime Text
+export QMD_EDITOR_URI="subl://open?url=file://{path}&line={line}"
+```
+
+Template placeholders:
+- `{path}` absolute filesystem path (URI-encoded)
+- `{line}` 1-based line number
+- `{col}` or `{column}` 1-based column number
 
 - **Path**: Collection-relative path (e.g., `docs/guide.md`)
 - **Docid**: Short hash identifier (e.g., `#a1b2c3`) - use with `qmd get #a1b2c3`
@@ -777,6 +804,9 @@ llm_cache       -- Cached LLM responses (query expansion, rerank scores)
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `XDG_CACHE_HOME` | `~/.cache` | Cache directory location |
+| `QMD_LLAMA_GPU` | `auto` | Force llama.cpp GPU backend (`metal`, `vulkan`, `cuda`) or disable GPU with `false` |
+| `QMD_FORCE_CPU` | unset | Set to `1`/`true` to force CPU mode before any CUDA/Vulkan/Metal probing. Equivalent CLI flag: `--no-gpu`. |
+| `QMD_EMBED_PARALLELISM` | automatic | Override embedding/reranking context parallelism (1-8). Windows CUDA defaults to `1` because parallel CUDA contexts can crash with `ggml-cuda.cu:98`; use Vulkan or raise this only if your driver is stable. |
 
 ## How It Works
 

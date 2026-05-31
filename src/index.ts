@@ -23,7 +23,6 @@ import {
   structuredSearch,
   extractSnippet,
   addLineNumbers,
-  DEFAULT_EMBED_MODEL,
   DEFAULT_MULTI_GET_MAX_BYTES,
   reindexCollection,
   generateEmbeddings,
@@ -159,6 +158,8 @@ export interface SearchOptions {
   collections?: string[];
   /** Max results (default: 10) */
   limit?: number;
+  /** Max candidates to rerank (default: 40) */
+  candidateLimit?: number;
   /** Minimum score threshold */
   minScore?: number;
   /** Include explain traces */
@@ -290,6 +291,8 @@ export interface QMDStore {
   embed(options?: {
     force?: boolean;
     model?: string;
+    /** Restrict embedding to documents in one collection. */
+    collection?: string;
     maxDocsPerBatch?: number;
     maxBatchBytes?: number;
     chunkStrategy?: ChunkStrategy;
@@ -351,21 +354,26 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
   const hasYamlConfig = !!options.configPath;
 
   // Sync config into SQLite store_collections
+  let config: CollectionConfig | undefined;
   if (options.configPath) {
     // YAML mode: inject config source for write-through, sync to DB
     setConfigSource({ configPath: options.configPath });
-    const config = loadConfig();
+    config = loadConfig();
     syncConfigToDb(db, config);
   } else if (options.config) {
     // Inline config mode: inject config source for mutations, sync to DB
     setConfigSource({ config: options.config });
-    syncConfigToDb(db, options.config);
+    config = options.config;
+    syncConfigToDb(db, config);
   }
   // else: DB-only mode — no external config, use existing store_collections
 
   // Create a per-store LlamaCpp instance — lazy-loads models on first use,
   // auto-unloads after 5 min inactivity to free VRAM.
   const llm = new LlamaCpp({
+    embedModel: config?.models?.embed,
+    generateModel: config?.models?.generate,
+    rerankModel: config?.models?.rerank,
     inactivityTimeoutMs: 5 * 60 * 1000,
     disposeModelsOnInactivity: true,
   });
@@ -395,6 +403,7 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
           minScore: opts.minScore,
           explain: opts.explain,
           intent: opts.intent,
+          candidateLimit: opts.candidateLimit,
           skipRerank,
           chunkStrategy: opts.chunkStrategy,
         });
@@ -407,12 +416,13 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
         minScore: opts.minScore,
         explain: opts.explain,
         intent: opts.intent,
+        candidateLimit: opts.candidateLimit,
         skipRerank,
         chunkStrategy: opts.chunkStrategy,
       });
     },
     searchLex: async (q, opts) => internal.searchFTS(q, opts?.limit, opts?.collection),
-    searchVector: async (q, opts) => internal.searchVec(q, DEFAULT_EMBED_MODEL, opts?.limit, opts?.collection),
+    searchVector: async (q, opts) => internal.searchVec(q, llm.embedModelName, opts?.limit, opts?.collection),
     expandQuery: async (q, opts) => internal.expandQuery(q, undefined, opts?.intent),
     get: async (pathOrDocid, opts) => internal.findDocument(pathOrDocid, opts),
     getDocumentBody: async (pathOrDocid, opts) => {
@@ -511,6 +521,7 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
       return generateEmbeddings(internal, {
         force: embedOpts?.force,
         model: embedOpts?.model,
+        collection: embedOpts?.collection,
         maxDocsPerBatch: embedOpts?.maxDocsPerBatch,
         maxBatchBytes: embedOpts?.maxBatchBytes,
         chunkStrategy: embedOpts?.chunkStrategy,
