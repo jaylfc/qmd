@@ -83,6 +83,7 @@ import {
 } from "../store.js";
 import { disposeDefaultLlamaCpp, getDefaultLlamaCpp, getDefaultLLM, setDefaultLlamaCpp, setDefaultLLM, LlamaCpp, withLLMSession, pullModels, DEFAULT_MODEL_CACHE_DIR, resolveEmbedModel, resolveGenerateModel, resolveRerankModel, resolveModels, inspectGgufFile, isDarwinMetalMitigationActive } from "../llm.js";
 import { RemoteLLM } from "../llm-remote.js";
+import { OllamaLLM } from "../llm-ollama.js";
 import { startServer } from "../serve.js";
 import {
   formatSearchResults,
@@ -140,6 +141,11 @@ function getStore(): ReturnType<typeof createStore> {
         // Remote backend: embeddings/rerank/expansion are served by a remote
         // `qmd serve` endpoint — no local models are loaded or required.
         setDefaultLLM(new RemoteLLM(serverUrl));
+      } else if (process.env.QMD_BACKEND === "ollama") {
+        // Ollama-compatible backend (Ollama on GPU, rkllama on NPU, etc.) —
+        // models are served by that process; no local models are loaded.
+        const url = process.env.QMD_BACKEND_URL || process.env.RKLLAMA_URL || "http://localhost:11434";
+        setDefaultLLM(new OllamaLLM({ url }));
       } else {
         const activeModels = ensureModelsConfiguredForCli();
         setDefaultLlamaCpp(new LlamaCpp({
@@ -2898,6 +2904,11 @@ function parseCLI() {
       server: { type: "string" },
       // `qmd serve` bind address (default 0.0.0.0); pairs with --port.
       bind: { type: "string" },
+      // Model backend: "local" (bundled llama.cpp, default) or "ollama"
+      // (an Ollama-compatible server, e.g. Ollama on GPU or rkllama on NPU).
+      backend: { type: "string" },
+      "backend-url": { type: "string" },
+      "rkllama-url": { type: "string" }, // deprecated alias for --backend-url
     },
     allowPositionals: true,
     strict: false, // Allow unknown options to pass through
@@ -2911,6 +2922,16 @@ function parseCLI() {
   // Stored in env so the lazily-created store (getStore) picks it up.
   if (typeof values.server === "string" && values.server) {
     process.env.QMD_SERVER = values.server;
+  }
+  // --backend ollama [--backend-url ...] routes models to an Ollama-compatible
+  // server. Stored in env (mirrors the QMD_BACKEND used by the systemd unit).
+  if (typeof values.backend === "string" && values.backend) {
+    process.env.QMD_BACKEND = values.backend;
+  }
+  const backendUrlFlag = (typeof values["backend-url"] === "string" && values["backend-url"])
+    || (typeof values["rkllama-url"] === "string" && values["rkllama-url"]);
+  if (backendUrlFlag) {
+    process.env.QMD_BACKEND_URL = backendUrlFlag;
   }
 
   // Select index name (default: "index"). If no explicit --index is supplied,
