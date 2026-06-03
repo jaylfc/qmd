@@ -8,6 +8,17 @@ QMD combines BM25 full-text search, vector semantic search, and LLM re-ranking�
 
 You can read more about QMD's progress in the [CHANGELOG](CHANGELOG.md).
 
+> ## Fork note — `@jaylfc/qmd`
+>
+> This is a fork of [tobi/qmd](https://github.com/tobi/qmd) (tracking **v2.5.3**), published to npm as **`@jaylfc/qmd`**. It preserves upstream behaviour and adds a **pluggable model backend** so qmd can run as a thin client or share one model host across machines:
+>
+> - **`qmd serve [--port N] [--bind ADDR]`** — run qmd as an HTTP model server (`POST /embed`, `/rerank`, `/expand`; `GET /health`, `/status`).
+> - **`--server <url>`** — point a qmd client at a remote `qmd serve`; embeddings / reranking / expansion are served remotely, with no local models loaded (`RemoteLLM`).
+> - **`--backend ollama [--backend-url <url>]`** (or env `QMD_BACKEND=ollama`) — use an Ollama-compatible server as the model provider: Ollama on a GPU, or rkllama on an RK3588 NPU (`OllamaLLM`).
+> - Internally, consumers program to the `LLM` interface via a `setDefaultLLM()` / `createStore({ llm })` injection seam. `LlamaCpp` stays the default, and token-aware chunk truncation degrades gracefully to character-based when a backend exposes no tokenizer.
+>
+> Install: `npm install -g @jaylfc/qmd`. The backend-decoupling refactor that makes this possible is proposed upstream in [tobi/qmd#692](https://github.com/tobi/qmd/issues/692).
+
 ## Quick Start
 
 ```sh
